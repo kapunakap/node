@@ -44,11 +44,18 @@ type HermesErrorResponse struct {
 	ErrorMessage string `json:"message"`
 	ErrorData    string `json:"data"`
 	c            error
+	statusCode   int
 }
 
 // Error returns the associated error
 func (aer HermesErrorResponse) Error() string {
-	return aer.c.Error()
+	if aer.c != nil {
+		return aer.c.Error()
+	}
+	if aer.ErrorMessage != "" {
+		return aer.ErrorMessage
+	}
+	return "unknown hermes error"
 }
 
 // Cause returns the associated cause
@@ -64,6 +71,46 @@ func (aer HermesErrorResponse) Unwrap() error {
 // Data returns the associated data
 func (aer HermesErrorResponse) Data() string {
 	return aer.ErrorData
+}
+
+// HTTPStatusCode returns the HTTP status code returned by Hermes.
+func (aer HermesErrorResponse) HTTPStatusCode() int {
+	return aer.statusCode
+}
+
+type hermesHTTPError struct {
+	statusCode int
+	err        error
+}
+
+func (e hermesHTTPError) Error() string {
+	return e.err.Error()
+}
+
+func (e hermesHTTPError) Unwrap() error {
+	return e.err
+}
+
+func (e hermesHTTPError) HTTPStatusCode() int {
+	return e.statusCode
+}
+
+type hermesHTTPStatusError interface {
+	HTTPStatusCode() int
+}
+
+func isHermesServerError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	var statusErr hermesHTTPStatusError
+	if !errors.As(err, &statusErr) {
+		return false
+	}
+
+	status := statusErr.HTTPStatusCode()
+	return status >= http.StatusInternalServerError && status <= 599
 }
 
 // UnmarshalJSON unmarshals given data to HermesErrorResponse
@@ -417,17 +464,25 @@ func (ac *HermesCaller) doRequest(req *http.Request, to any) error {
 		return nil
 	}
 
-	// parse error body
-	hermesError := HermesErrorResponse{}
+	// Parse the error body while preserving the HTTP status. Generic 5xx
+	// responses can be ambiguous: Hermes may have committed a promise even
+	// when the provider did not receive a successful response.
+	hermesError := HermesErrorResponse{statusCode: resp.StatusCode}
 	if string(body) == "" {
-		hermesError.ErrorMessage = "Unknown error"
-		return hermesError
+		return hermesHTTPError{
+			statusCode: resp.StatusCode,
+			err:        errors.New("unknown hermes error"),
+		}
 	}
 
 	err = json.Unmarshal(body, &hermesError)
 	if err != nil {
-		return fmt.Errorf("could not unmarshal error body: %w", err)
+		return hermesHTTPError{
+			statusCode: resp.StatusCode,
+			err:        fmt.Errorf("could not unmarshal error body: %w", err),
+		}
 	}
+	hermesError.statusCode = resp.StatusCode
 
 	return hermesError
 }
@@ -494,6 +549,30 @@ type LatestPromise struct {
 	Signature string   `json:"Signature"`
 }
 
+func (lp LatestPromise) toPromise() (crypto.Promise, error) {
+	decodedChannelID, err := hex.DecodeString(strings.TrimPrefix(lp.ChannelID, "0x"))
+	if err != nil {
+		return crypto.Promise{}, fmt.Errorf("could not decode channel ID: %w", err)
+	}
+	decodedHashlock, err := hex.DecodeString(strings.TrimPrefix(lp.Hashlock, "0x"))
+	if err != nil {
+		return crypto.Promise{}, fmt.Errorf("could not decode hashlock: %w", err)
+	}
+	decodedSignature, err := hex.DecodeString(strings.TrimPrefix(lp.Signature, "0x"))
+	if err != nil {
+		return crypto.Promise{}, fmt.Errorf("could not decode signature: %w", err)
+	}
+
+	return crypto.Promise{
+		ChainID:   lp.ChainID,
+		ChannelID: decodedChannelID,
+		Amount:    lp.Amount,
+		Fee:       lp.Fee,
+		Hashlock:  decodedHashlock,
+		Signature: decodedSignature,
+	}, nil
+}
+
 // isValid checks if the promise is really issued by the given identity
 func (lp LatestPromise) isValid(id string) error {
 	// if we've not promised anything, that's fine for us.
@@ -502,26 +581,9 @@ func (lp LatestPromise) isValid(id string) error {
 		return nil
 	}
 
-	decodedChannelID, err := hex.DecodeString(strings.TrimPrefix(lp.ChannelID, "0x"))
+	p, err := lp.toPromise()
 	if err != nil {
-		return fmt.Errorf("could not decode channel ID: %w", err)
-	}
-	decodedHashlock, err := hex.DecodeString(strings.TrimPrefix(lp.Hashlock, "0x"))
-	if err != nil {
-		return fmt.Errorf("could not decode hashlock: %w", err)
-	}
-	decodedSignature, err := hex.DecodeString(strings.TrimPrefix(lp.Signature, "0x"))
-	if err != nil {
-		return fmt.Errorf("could not decode signature: %w", err)
-	}
-
-	p := crypto.Promise{
-		ChainID:   lp.ChainID,
-		ChannelID: decodedChannelID,
-		Amount:    lp.Amount,
-		Fee:       lp.Fee,
-		Hashlock:  decodedHashlock,
-		Signature: decodedSignature,
+		return err
 	}
 
 	if !p.IsPromiseValid(common.HexToAddress(id)) {
