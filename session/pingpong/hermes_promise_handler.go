@@ -209,9 +209,12 @@ func (aph *HermesPromiseHandler) reconcileAmbiguousRequestPromise(providerID ide
 		!strings.EqualFold(latest.ChannelID, chid) ||
 		latest.ChainID != rp.ExchangeMessage.ChainID ||
 		!strings.EqualFold(latest.Hashlock, expectedHashlock) ||
+		latest.Amount == nil ||
+		latest.Amount.Sign() <= 0 ||
 		latest.Fee == nil ||
 		rp.TransactorFee == nil ||
-		latest.Fee.Cmp(rp.TransactorFee) != 0 {
+		latest.Fee.Cmp(rp.TransactorFee) != 0 ||
+		latest.Signature == "" {
 		return crypto.Promise{}, false
 	}
 
