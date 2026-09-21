@@ -70,6 +70,25 @@ func TestHermesCaller_RequestPromise_Error(t *testing.T) {
 	assert.NotNil(t, err)
 }
 
+func TestHermesCaller_RequestPromise_PreservesServerStatusForUnknownError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, err := w.Write([]byte(`{"cause":"","data":"","message":""}`))
+		assert.NoError(t, err)
+	}))
+	defer server.Close()
+
+	c := requests.NewHTTPClient("0.0.0.0", time.Second)
+	caller := NewHermesCaller(c, server.URL)
+	_, err := caller.RequestPromise(RequestPromise{})
+	assert.Error(t, err)
+	assert.True(t, isHermesServerError(err))
+
+	var statusErr hermesHTTPStatusError
+	assert.True(t, errors.As(err, &statusErr))
+	assert.Equal(t, http.StatusInternalServerError, statusErr.HTTPStatusCode())
+}
+
 func TestHermesCaller_RevealR_Error(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
