@@ -23,6 +23,7 @@ import (
 	stdErr "errors"
 	"fmt"
 	"math/big"
+	"strings"
 	"sync"
 	"time"
 
@@ -148,6 +149,17 @@ func (aph *HermesPromiseHandler) makeRequestPromiseFunc(providerID identity.Iden
 			return p, nil
 		}
 
+		// Do not blindly replay a request after an ambiguous Hermes 5xx. The
+		// request may already have committed. While this handler owns the
+		// serialized Hermes queue entry, check the provider's latest promise
+		// and only synthesize success when it exactly matches this request.
+		if isHermesServerError(err) {
+			if reconciled, ok := aph.reconcileAmbiguousRequestPromise(providerID, caller, rp); ok {
+				log.Warn().Msg("reconciled Hermes request_promise after ambiguous server error")
+				return reconciled, nil
+			}
+		}
+
 		if !stdErr.Is(err, ErrInvalidPreviuosLatestPromise) {
 			// We can only really handle the previuos promise is invalid error.
 			return crypto.Promise{}, err
@@ -174,6 +186,45 @@ func (aph *HermesPromiseHandler) makeRequestPromiseFunc(providerID identity.Iden
 
 		return caller.RequestPromise(rp)
 	}
+}
+
+func (aph *HermesPromiseHandler) reconcileAmbiguousRequestPromise(providerID identity.Identity, caller HermesHTTPRequester, rp RequestPromise) (crypto.Promise, bool) {
+	data, err := caller.GetProviderData(rp.ExchangeMessage.ChainID, providerID.Address)
+	if err != nil {
+		log.Warn().Err(err).Msg("could not reconcile ambiguous Hermes request_promise")
+		return crypto.Promise{}, false
+	}
+
+	chid, err := crypto.GenerateProviderChannelID(providerID.Address, rp.ExchangeMessage.HermesID)
+	if err != nil {
+		log.Warn().Err(err).Msg("could not generate provider channel ID while reconciling Hermes request_promise")
+		return crypto.Promise{}, false
+	}
+
+	latest := data.LatestPromise
+	expectedHashlock := "0x" + common.Bytes2Hex(rp.ExchangeMessage.Promise.Hashlock)
+
+	if !strings.EqualFold(data.Identity, providerID.Address) ||
+		!strings.EqualFold(data.ChannelID, chid) ||
+		!strings.EqualFold(latest.ChannelID, chid) ||
+		latest.ChainID != rp.ExchangeMessage.ChainID ||
+		!strings.EqualFold(latest.Hashlock, expectedHashlock) ||
+		latest.Amount == nil ||
+		latest.Amount.Sign() <= 0 ||
+		latest.Fee == nil ||
+		rp.TransactorFee == nil ||
+		latest.Fee.Cmp(rp.TransactorFee) != 0 ||
+		latest.Signature == "" {
+		return crypto.Promise{}, false
+	}
+
+	promise, err := latest.toPromise()
+	if err != nil {
+		log.Warn().Err(err).Msg("could not decode provider promise while reconciling Hermes request_promise")
+		return crypto.Promise{}, false
+	}
+
+	return promise, true
 }
 
 // PayAndSettle adds the request to the queue.

@@ -19,6 +19,7 @@ package pingpong
 
 import (
 	"errors"
+	"math/big"
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -114,6 +115,137 @@ func TestHermesPromiseHandler_RequestPromise_BubblesErrors(t *testing.T) {
 	err, more = <-ch
 	assert.False(t, more)
 	assert.Nil(t, err)
+}
+
+type reconcileHermesCaller struct {
+	mockHermesCaller
+	providerData      HermesUserInfo
+	providerDataErr   error
+	requestCalls      int
+	providerDataCalls int
+}
+
+func (c *reconcileHermesCaller) RequestPromise(rp RequestPromise) (crypto.Promise, error) {
+	c.requestCalls++
+	return crypto.Promise{}, c.errToReturn
+}
+
+func (c *reconcileHermesCaller) GetProviderData(chainID int64, id string) (HermesUserInfo, error) {
+	c.providerDataCalls++
+	return c.providerData, c.providerDataErr
+}
+
+func TestHermesPromiseHandler_makeRequestPromiseFunc_ReconcilesAmbiguousServerError(t *testing.T) {
+	providerID := identity.FromAddress("0x0000000000000000000000000000000000000001")
+	hermesID := common.HexToAddress("0x0000000000000000000000000000000000000002")
+	channelID, err := crypto.GenerateProviderChannelID(providerID.Address, hermesID.Hex())
+	assert.NoError(t, err)
+
+	fee := big.NewInt(42)
+	hashlock := []byte{0x01, 0x02, 0x03}
+	latest := LatestPromise{
+		ChainID:   137,
+		ChannelID: channelID,
+		Amount:    big.NewInt(100),
+		Fee:       new(big.Int).Set(fee),
+		Hashlock:  "0x" + common.Bytes2Hex(hashlock),
+		Signature: "0x01",
+	}
+	caller := &reconcileHermesCaller{
+		mockHermesCaller: mockHermesCaller{
+			errToReturn: hermesHTTPError{
+				statusCode: 500,
+				err:        errors.New("ambiguous server error"),
+			},
+		},
+		providerData: HermesUserInfo{
+			Identity:      providerID.Address,
+			ChannelID:     channelID,
+			LatestPromise: latest,
+		},
+	}
+
+	rp := RequestPromise{
+		ExchangeMessage: crypto.ExchangeMessage{
+			ChainID:  137,
+			HermesID: hermesID.Hex(),
+			Promise: crypto.Promise{
+				Hashlock: hashlock,
+			},
+		},
+		TransactorFee: fee,
+	}
+
+	got, err := (&HermesPromiseHandler{}).makeRequestPromiseFunc(providerID, caller)(rp)
+	assert.NoError(t, err)
+
+	expected, err := latest.toPromise()
+	assert.NoError(t, err)
+	assert.Equal(t, expected, got)
+	assert.Equal(t, 1, caller.requestCalls)
+	assert.Equal(t, 1, caller.providerDataCalls)
+}
+
+func TestHermesPromiseHandler_makeRequestPromiseFunc_DoesNotReconcileMismatch(t *testing.T) {
+	providerID := identity.FromAddress("0x0000000000000000000000000000000000000001")
+	hermesID := common.HexToAddress("0x0000000000000000000000000000000000000002")
+	channelID, err := crypto.GenerateProviderChannelID(providerID.Address, hermesID.Hex())
+	assert.NoError(t, err)
+
+	fee := big.NewInt(42)
+	caller := &reconcileHermesCaller{
+		mockHermesCaller: mockHermesCaller{
+			errToReturn: hermesHTTPError{
+				statusCode: 500,
+				err:        errors.New("ambiguous server error"),
+			},
+		},
+		providerData: HermesUserInfo{
+			Identity:  providerID.Address,
+			ChannelID: channelID,
+			LatestPromise: LatestPromise{
+				ChainID:   137,
+				ChannelID: channelID,
+				Amount:    big.NewInt(100),
+				Fee:       new(big.Int).Set(fee),
+				Hashlock:  "0xdeadbeef",
+				Signature: "0x01",
+			},
+		},
+	}
+
+	rp := RequestPromise{
+		ExchangeMessage: crypto.ExchangeMessage{
+			ChainID:  137,
+			HermesID: hermesID.Hex(),
+			Promise: crypto.Promise{
+				Hashlock: []byte{0x01, 0x02, 0x03},
+			},
+		},
+		TransactorFee: fee,
+	}
+
+	_, err = (&HermesPromiseHandler{}).makeRequestPromiseFunc(providerID, caller)(rp)
+	assert.Error(t, err)
+	assert.Equal(t, 1, caller.requestCalls)
+	assert.Equal(t, 1, caller.providerDataCalls)
+}
+
+func TestHermesPromiseHandler_makeRequestPromiseFunc_DoesNotReconcileNonServerError(t *testing.T) {
+	providerID := identity.FromAddress("0x0000000000000000000000000000000000000001")
+	caller := &reconcileHermesCaller{
+		mockHermesCaller: mockHermesCaller{
+			errToReturn: hermesHTTPError{
+				statusCode: 400,
+				err:        errors.New("bad request"),
+			},
+		},
+	}
+
+	_, err := (&HermesPromiseHandler{}).makeRequestPromiseFunc(providerID, caller)(RequestPromise{})
+	assert.Error(t, err)
+	assert.Equal(t, 1, caller.requestCalls)
+	assert.Zero(t, caller.providerDataCalls)
 }
 
 func TestHermesPromiseHandler_recoverR(t *testing.T) {
